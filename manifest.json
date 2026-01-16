@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Video Downloader Pro",
+  "version": "1.0.1",
+  "description": "Professional video downloader supporting MP4, WEBM, and M3U8 formats.",
+  "permissions": [
+    "webRequest",
+    "declarativeNetRequestWithHostAccess",
+    "storage",
+    "downloads",
+    "offscreen",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "src/background/service_worker.js"
+  },
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Video Downloader"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/offscreen/offscreen.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
