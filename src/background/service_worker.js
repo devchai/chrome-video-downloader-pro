@@ -126,7 +126,8 @@ chrome.webRequest.onHeadersReceived.addListener(
         contentType: contentType,
         size: size,
         timestamp: Date.now(),
-        tabId: details.tabId
+        tabId: details.tabId,
+        thumbnail: null
       };
 
       if (!detectedVideos[details.tabId]) {
@@ -139,10 +140,13 @@ chrome.webRequest.onHeadersReceived.addListener(
         if (!urlReferers[videoData.url] && details.initiator) {
            urlReferers[videoData.url] = details.initiator;
         }
-        
+
         console.log('Video Detected:', videoData);
         detectedVideos[details.tabId].push(videoData);
         updateBadge(details.tabId);
+
+        // 썸네일 추출 요청
+        fetchThumbnailFromTab(details.tabId, videoData.url);
       }
     }
   },
@@ -202,3 +206,43 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (detectedVideos[tabId]) delete detectedVideos[tabId];
 });
+
+// 썸네일 추출 함수
+async function fetchThumbnailFromTab(tabId, videoUrl) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, {
+      action: "getThumbnails",
+      videoUrl: videoUrl
+    });
+
+    if (response && response.thumbnails && response.thumbnails.length > 0) {
+      // 우선순위: capture > poster > og:image > twitter:image > schema.org > related-img
+      const priority = ['capture', 'poster', 'og:image', 'twitter:image', 'schema.org', 'related-img'];
+      let bestThumbnail = null;
+
+      for (const source of priority) {
+        const found = response.thumbnails.find(t => t.source === source);
+        if (found) {
+          bestThumbnail = found.url;
+          break;
+        }
+      }
+
+      if (!bestThumbnail && response.thumbnails.length > 0) {
+        bestThumbnail = response.thumbnails[0].url;
+      }
+
+      // 해당 비디오에 썸네일 할당
+      if (detectedVideos[tabId]) {
+        const video = detectedVideos[tabId].find(v => v.url === videoUrl);
+        if (video) {
+          video.thumbnail = bestThumbnail;
+          console.log('Thumbnail assigned:', bestThumbnail);
+        }
+      }
+    }
+  } catch (e) {
+    // Content script가 로드되지 않은 페이지일 수 있음
+    console.log('Thumbnail fetch failed:', e.message);
+  }
+}

@@ -87,7 +87,12 @@ function renderVideos(videos, pageTitle) {
     if (filename.length > 30) filename = filename.substring(0, 30) + '...';
     if (!filename || filename.trim() === '') filename = `Video ${index + 1}`;
 
+    const thumbnailHtml = video.thumbnail
+      ? `<div class="video-thumbnail"><img src="${video.thumbnail}" alt="thumbnail" onerror="this.parentElement.innerHTML='<div class=\\'no-thumb\\'><svg width=\\'24\\' height=\\'24\\' viewBox=\\'0 0 24 24\\' fill=\\'none\\' stroke=\\'currentColor\\'><polygon points=\\'5 3 19 12 5 21 5 3\\'></polygon></svg></div>'"/></div>`
+      : `<div class="video-thumbnail"><div class="no-thumb"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></div></div>`;
+
     card.innerHTML = `
+      ${thumbnailHtml}
       <div class="video-info">
         <div class="video-title" title="${video.url}">${pageTitle || filename}</div>
         <div class="video-meta">
