@@ -70,7 +70,30 @@ BLOCKED_DOMAINS = ['youtube.com', 'googlevideo.com', 'youtu.be']
 - `downloadVideo` - Trigger download (direct or HLS)
 - `processHLS` - Offscreen: parse and download HLS stream
 - `downloadDirect` - Offscreen: simple blob download
-- `downloadProgress` - Progress updates to popup
+- `downloadProgress` - Progress updates to popup (includes errorDetails on failure)
+
+### Error Logging System
+
+**Offscreen Document Logger** (`src/offscreen/offscreen.js`)
+- `LOG_TAG`: `[OffscreenDownloader]` prefix for all logs
+- `log(method, msg, data)`: General logging with method context
+- `logError(method, msg, error)`: Detailed error logging with structured output
+  - Returns `errorDetails` object: `{ timestamp, method, message, errorName, errorMessage, errorStack }`
+
+**Error Types Tracked**:
+- `HTTPError`: HTTP status code failures (4xx, 5xx)
+- `EmptyResponseError`: 0 bytes received from server
+- `PlaylistFetchError`: Failed to fetch HLS playlist
+- `VideoPlaylistFetchError`: Failed to fetch video variant playlist
+- `InitSegmentError`: Failed to download fMP4 init segment
+- `SegmentFetchError`: Individual segment download failure
+- `AllSegmentsFailedError`: All segments failed to download
+- `TransmuxError`: mux.js TS-to-MP4 conversion failure
+- `EmptyBlobError` / `EmptyOutputError`: Final merged file is 0 bytes
+
+**Console Viewing**:
+- Offscreen document logs: Chrome DevTools → Sources → offscreen.html context
+- Popup error logs: Right-click popup → Inspect → Console tab
 
 ## Constraints
 

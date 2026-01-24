@@ -4,6 +4,9 @@ importScripts('../assets/lib/mux.min.js');
 let detectedVideos = {};
 // We store Referer for each detected video URL
 let urlReferers = {};
+// DNR 규칙이 적용된 도메인 추적
+let ruledDomains = new Set();
+let nextRuleId = 1001;
 
 const TARGET_MIME_TYPES = new Set([
   'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime',
@@ -52,18 +55,42 @@ async function ensureOffscreenDocument() {
 }
 
 // 1. Dynamic Header Modification Logic
+// 다운로드할 도메인에 대해 Referer/Origin 헤더를 자동 설정
 async function setDynamicRules(targetUrl, referer) {
-  const domain = new URL(targetUrl).hostname;
-  
+  const targetDomain = new URL(targetUrl).hostname;
+
   // Clean existing dynamic rules
   await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [999]
+    removeRuleIds: [999, 1000]
   });
 
-  // Add new rule for this specific download
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    addRules: [{
-      "id": 999,
+  const rules = [];
+
+  // Rule 999: 비디오 URL 도메인에 대한 규칙
+  rules.push({
+    "id": 999,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "Referer", "operation": "set", "value": referer },
+        { "header": "Origin", "operation": "set", "value": new URL(referer).origin }
+      ]
+    },
+    "condition": {
+      // 도메인 전체에 적용 (HLS 세그먼트 포함)
+      "requestDomains": [targetDomain],
+      "resourceTypes": ["xmlhttprequest", "media", "other"]
+    }
+  });
+
+  // Rule 1000: CDN 서브도메인 지원 (예: cdn1.example.com, cdn2.example.com)
+  // targetDomain이 서브도메인인 경우 상위 도메인도 포함
+  const domainParts = targetDomain.split('.');
+  if (domainParts.length > 2) {
+    const parentDomain = domainParts.slice(-2).join('.');
+    rules.push({
+      "id": 1000,
       "priority": 1,
       "action": {
         "type": "modifyHeaders",
@@ -73,13 +100,51 @@ async function setDynamicRules(targetUrl, referer) {
         ]
       },
       "condition": {
-        "urlFilter": targetUrl, // Exact match might be tricky if params change, use domain
-        "domains": [domain],
-        "resourceTypes": ["xmlhttprequest"] 
+        "urlFilter": `||${parentDomain}`,
+        "resourceTypes": ["xmlhttprequest", "media", "other"]
       }
-    }]
+    });
+  }
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    addRules: rules
   });
-  console.log(`[DNR] Rules updated for ${domain} with Referer: ${referer}`);
+
+  console.log(`[DNR] Rules updated for ${targetDomain} with Referer: ${referer}`);
+  console.log(`[DNR] Active rules:`, rules.length);
+
+  // 초기 도메인 추적
+  ruledDomains = new Set([targetDomain]);
+  nextRuleId = 1001;
+}
+
+// 추가 도메인에 대한 규칙 동적 추가 (HLS 세그먼트가 다른 CDN에 있을 때)
+async function addDomainRule(domain, referer) {
+  try {
+    const ruleId = nextRuleId++;
+
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      addRules: [{
+        "id": ruleId,
+        "priority": 1,
+        "action": {
+          "type": "modifyHeaders",
+          "requestHeaders": [
+            { "header": "Referer", "operation": "set", "value": referer },
+            { "header": "Origin", "operation": "set", "value": new URL(referer).origin }
+          ]
+        },
+        "condition": {
+          "requestDomains": [domain],
+          "resourceTypes": ["xmlhttprequest", "media", "other"]
+        }
+      }]
+    });
+
+    console.log(`[DNR] Added rule ${ruleId} for new domain: ${domain}`);
+  } catch (e) {
+    console.error(`[DNR] Failed to add rule for ${domain}:`, e);
+  }
 }
 
 
@@ -159,6 +224,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "getVideos") {
     sendResponse({ videos: detectedVideos[request.tabId] || [] });
     return true;
+  }
+
+  // Offscreen에서 새 도메인 규칙 요청
+  if (request.action === "addDomainRule") {
+    const { domain, referer } = request;
+    if (domain && referer && !ruledDomains.has(domain)) {
+      addDomainRule(domain, referer);
+      ruledDomains.add(domain);
+    }
+    return false;
   } 
   
   else if (request.action === "downloadVideo") {

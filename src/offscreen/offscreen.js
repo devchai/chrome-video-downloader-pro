@@ -1,94 +1,271 @@
 // Offscreen Document for HLS & Direct Processing
 
+// 전역 referer 저장 (세그먼트 다운로드에서 사용)
+let currentReferer = null;
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "processHLS") {
+    currentReferer = request.referer || null;
     processHLS(request.url, request.filename);
   } else if (request.action === "downloadDirect") {
+    currentReferer = request.referer || null;
     processDirectDownload(request.url, request.filename);
   }
 });
 
-function sendProgress(percent, status) {
-  chrome.runtime.sendMessage({
+const LOG_TAG = '[OffscreenDownloader]';
+
+function log(method, msg, data = null) {
+  const timestamp = new Date().toISOString();
+  const logMsg = `${LOG_TAG} ${method}: ${msg}`;
+  if (data) {
+    console.log(logMsg, data);
+  } else {
+    console.log(logMsg);
+  }
+}
+
+function logError(method, msg, error = null) {
+  const timestamp = new Date().toISOString();
+  const errorDetails = {
+    timestamp,
+    method,
+    message: msg,
+    errorName: error?.name || 'Unknown',
+    errorMessage: error?.message || 'No message',
+    errorStack: error?.stack || 'No stack trace'
+  };
+  console.error(`${LOG_TAG} ERROR in ${method}:`, errorDetails);
+  return errorDetails;
+}
+
+function sendProgress(percent, status, errorDetails = null) {
+  const message = {
     action: "downloadProgress",
     percent: percent,
     status: status
-  });
+  };
+  if (errorDetails) {
+    message.errorDetails = errorDetails;
+  }
+  chrome.runtime.sendMessage(message);
 }
 
 async function processDirectDownload(url, filename) {
-  console.log(`[Offscreen] Direct download: ${url}`);
+  const METHOD = 'processDirectDownload';
+  log(METHOD, `Starting direct download`, { url, filename, referer: currentReferer });
   sendProgress(10, "Starting...");
-  
+
   try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    
+    // Referer 헤더를 포함한 fetch 옵션
+    const fetchOptions = buildFetchOptions(url);
+    log(METHOD, `Fetching URL...`, { headers: fetchOptions.headers });
+    const response = await fetch(url, fetchOptions);
+
+    if (!response.ok) {
+      const errorDetails = logError(METHOD, `HTTP request failed`, {
+        name: 'HTTPError',
+        message: `HTTP ${response.status} ${response.statusText}`,
+        stack: `URL: ${url}\nStatus: ${response.status}\nStatusText: ${response.statusText}\nHeaders: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}`
+      });
+      sendProgress(0, `Error: HTTP ${response.status} - ${response.statusText}`, errorDetails);
+      return;
+    }
+
+    log(METHOD, `Response received`, {
+      status: response.status,
+      contentType: response.headers.get('content-type'),
+      contentLength: response.headers.get('content-length')
+    });
+
     const blob = await response.blob();
-    
-    if (blob.size === 0) throw new Error("0 Bytes Received");
+    log(METHOD, `Blob created`, { size: blob.size, type: blob.type });
+
+    if (blob.size === 0) {
+      const errorDetails = logError(METHOD, `Empty response received`, {
+        name: 'EmptyResponseError',
+        message: '0 Bytes Received - Server returned empty content',
+        stack: `URL: ${url}\nContent-Type: ${response.headers.get('content-type')}\nContent-Length: ${response.headers.get('content-length')}`
+      });
+      sendProgress(0, "Error: 0 Bytes Received", errorDetails);
+      return;
+    }
 
     sendProgress(100, "Saving...");
-    
+    log(METHOD, `Triggering download`, { filename: `${filename}.mp4`, blobSize: blob.size });
+
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = blobUrl;
     a.download = `${filename}.mp4`;
     a.click();
-    
+
     setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-    
+    log(METHOD, `Download completed successfully`);
+
   } catch (error) {
-    console.error("Direct download failed:", error);
-    sendProgress(0, "Error: " + error.message);
+    const errorDetails = logError(METHOD, `Direct download failed`, error);
+
+    // 네트워크 오류 상세 분류
+    let userMessage = "Error: ";
+    if (error.name === 'TypeError' && error.message.includes('fetch')) {
+      userMessage += "Network error - Could not reach server";
+    } else if (error.name === 'AbortError') {
+      userMessage += "Request was aborted";
+    } else if (error.message.includes('CORS')) {
+      userMessage += "CORS blocked - Server does not allow this request";
+    } else {
+      userMessage += error.message;
+    }
+
+    sendProgress(0, userMessage, errorDetails);
   }
 }
 
+// Referer 헤더를 포함한 fetch 옵션 생성
+// 주의: fetch API에서 'Referer' 헤더는 forbidden header이므로 직접 설정 불가
+// declarativeNetRequest를 통해 헤더가 자동으로 추가됨
+function buildFetchOptions(url) {
+  const options = {
+    mode: 'cors',
+    credentials: 'include',  // 쿠키 포함 (일부 CDN에서 필요)
+    referrerPolicy: 'no-referrer-when-downgrade'
+  };
+
+  if (currentReferer) {
+    options.referrer = currentReferer;
+  }
+
+  return options;
+}
+
+// 새 도메인 발견 시 Service Worker에 알림 (DNR 규칙 추가 요청)
+async function notifyNewDomain(url) {
+  try {
+    const domain = new URL(url).hostname;
+    await chrome.runtime.sendMessage({
+      action: 'addDomainRule',
+      domain: domain,
+      referer: currentReferer
+    });
+    log('notifyNewDomain', `Requested DNR rule for domain`, { domain });
+  } catch (e) {
+    // 무시 - 규칙 추가 실패해도 계속 진행
+  }
+}
+
+// 세그먼트 URL들의 도메인을 수집하여 DNR 규칙 등록
+async function registerSegmentDomains(segmentUrls, initUrl) {
+  const domains = new Set();
+
+  // Init 세그먼트 도메인
+  if (initUrl) {
+    try {
+      domains.add(new URL(initUrl).hostname);
+    } catch (e) {}
+  }
+
+  // 모든 세그먼트 도메인 수집 (처음 10개만 샘플링)
+  for (let i = 0; i < Math.min(segmentUrls.length, 10); i++) {
+    try {
+      domains.add(new URL(segmentUrls[i]).hostname);
+    } catch (e) {}
+  }
+
+  log('registerSegmentDomains', `Registering domains for DNR`, { domains: Array.from(domains) });
+
+  // 각 도메인에 대해 규칙 요청
+  for (const domain of domains) {
+    await notifyNewDomain(`https://${domain}/`);
+  }
+
+  // 규칙이 적용될 시간을 위해 약간의 딜레이
+  await new Promise(resolve => setTimeout(resolve, 100));
+}
+
 async function processHLS(masterUrl, filename) {
-  console.log(`[Offscreen] Starting HLS: ${masterUrl}`);
+  const METHOD = 'processHLS';
+  log(METHOD, `Starting HLS processing`, { masterUrl, filename, referer: currentReferer });
   sendProgress(0, "Fetching Playlist...");
 
   try {
-    const response = await fetch(masterUrl);
-    if (!response.ok) throw new Error(`Playlist HTTP ${response.status}`);
+    const fetchOptions = buildFetchOptions(masterUrl);
+    log(METHOD, `Fetching master playlist...`, { headers: fetchOptions.headers });
+    const response = await fetch(masterUrl, fetchOptions);
+
+    if (!response.ok) {
+      const errorDetails = logError(METHOD, `Failed to fetch master playlist`, {
+        name: 'PlaylistFetchError',
+        message: `HTTP ${response.status} ${response.statusText}`,
+        stack: `URL: ${masterUrl}\nStatus: ${response.status}\nStatusText: ${response.statusText}`
+      });
+      sendProgress(0, `Error: Playlist HTTP ${response.status}`, errorDetails);
+      return;
+    }
 
     const text = await response.text();
+    log(METHOD, `Playlist fetched`, { contentLength: text.length, isMaster: text.includes('#EXT-X-STREAM-INF') });
 
     // Check if this is a master playlist (has variants)
     if (text.includes('#EXT-X-STREAM-INF')) {
+      log(METHOD, `Parsing master playlist for variants...`);
       const { videoPlaylistUrl, audioPlaylistUrl } = parseMasterPlaylist(text, masterUrl);
 
       if (videoPlaylistUrl) {
-        console.log('[Offscreen] Video playlist:', videoPlaylistUrl);
-        console.log('[Offscreen] Audio playlist:', audioPlaylistUrl || 'embedded or none');
+        log(METHOD, `Variant playlists found`, { videoPlaylistUrl, audioPlaylistUrl: audioPlaylistUrl || 'embedded or none' });
 
-        const videoResponse = await fetch(videoPlaylistUrl);
-        if (!videoResponse.ok) throw new Error(`Video Playlist HTTP ${videoResponse.status}`);
+        log(METHOD, `Fetching video playlist...`);
+        const videoResponse = await fetch(videoPlaylistUrl, buildFetchOptions(videoPlaylistUrl));
+        if (!videoResponse.ok) {
+          const errorDetails = logError(METHOD, `Failed to fetch video playlist`, {
+            name: 'VideoPlaylistFetchError',
+            message: `HTTP ${videoResponse.status} ${videoResponse.statusText}`,
+            stack: `URL: ${videoPlaylistUrl}\nStatus: ${videoResponse.status}`
+          });
+          sendProgress(0, `Error: Video Playlist HTTP ${videoResponse.status}`, errorDetails);
+          return;
+        }
         const videoText = await videoResponse.text();
+        log(METHOD, `Video playlist fetched`, { contentLength: videoText.length });
 
         let audioText = null;
         let audioBaseUrl = null;
         if (audioPlaylistUrl) {
-          const audioResponse = await fetch(audioPlaylistUrl);
+          log(METHOD, `Fetching audio playlist...`);
+          const audioResponse = await fetch(audioPlaylistUrl, buildFetchOptions(audioPlaylistUrl));
           if (audioResponse.ok) {
             audioText = await audioResponse.text();
             audioBaseUrl = audioPlaylistUrl;
-            console.log('[Offscreen] Audio playlist fetched successfully');
+            log(METHOD, `Audio playlist fetched successfully`, { contentLength: audioText.length });
+          } else {
+            log(METHOD, `Audio playlist fetch failed (non-critical)`, { status: audioResponse.status });
           }
         }
 
         await downloadSegmentsWithAudio(videoText, videoPlaylistUrl, audioText, audioBaseUrl, filename);
       } else {
+        log(METHOD, `No video playlist URL found in master, using single playlist mode`);
         await downloadSegments(text, masterUrl, filename);
       }
     } else {
       // Single media playlist (video+audio combined or video-only)
+      log(METHOD, `Single media playlist detected`);
       await downloadSegments(text, masterUrl, filename);
     }
 
   } catch (error) {
-    console.error('[Offscreen] Error processing HLS:', error);
-    sendProgress(0, "Error: " + error.message);
+    const errorDetails = logError(METHOD, `HLS processing failed`, error);
+
+    let userMessage = "Error: ";
+    if (error.name === 'TypeError' && error.message.includes('fetch')) {
+      userMessage += "Network error - Could not fetch playlist";
+    } else if (error.message.includes('Invalid')) {
+      userMessage += "Invalid playlist format";
+    } else {
+      userMessage += error.message;
+    }
+
+    sendProgress(0, userMessage, errorDetails);
   }
 }
 
@@ -136,66 +313,136 @@ function parseMasterPlaylist(text, baseUrl) {
 }
 
 async function downloadSegmentsWithAudio(videoPlaylistText, videoBaseUrl, audioPlaylistText, audioBaseUrl, filename) {
+  const METHOD = 'downloadSegmentsWithAudio';
+  log(METHOD, `Starting download with audio`, { videoBaseUrl, audioBaseUrl, filename });
   sendProgress(5, "Parsing playlists...");
 
   // Parse video segments
   const videoData = parseMediaPlaylist(videoPlaylistText, videoBaseUrl);
-  console.log(`[Offscreen] Video: ${videoData.segments.length} segments, init: ${!!videoData.initUrl}`);
+  log(METHOD, `Video playlist parsed`, { segmentCount: videoData.segments.length, hasInit: !!videoData.initUrl });
+
+  // 세그먼트 도메인들에 대해 DNR 규칙 요청
+  await registerSegmentDomains(videoData.segments, videoData.initUrl);
 
   // Parse audio segments if available
   let audioData = null;
   if (audioPlaylistText) {
     audioData = parseMediaPlaylist(audioPlaylistText, audioBaseUrl);
-    console.log(`[Offscreen] Audio: ${audioData.segments.length} segments, init: ${!!audioData.initUrl}`);
+    log(METHOD, `Audio playlist parsed`, { segmentCount: audioData.segments.length, hasInit: !!audioData.initUrl });
   }
 
   const totalSegments = videoData.segments.length + (audioData ? audioData.segments.length : 0);
   let downloaded = 0;
+  let failedSegments = [];
 
   // Download video init segment
   let videoInitData = null;
   if (videoData.initUrl) {
     try {
-      const res = await fetch(videoData.initUrl);
-      if (res.ok) videoInitData = new Uint8Array(await res.arrayBuffer());
-    } catch (e) { console.error('Video init failed:', e); }
+      log(METHOD, `Downloading video init segment...`, { url: videoData.initUrl });
+      const res = await fetch(videoData.initUrl, buildFetchOptions(videoData.initUrl));
+      if (res.ok) {
+        videoInitData = new Uint8Array(await res.arrayBuffer());
+        log(METHOD, `Video init segment downloaded`, { size: videoInitData.byteLength });
+      } else {
+        logError(METHOD, `Video init segment fetch failed`, {
+          name: 'InitSegmentError',
+          message: `HTTP ${res.status}`,
+          stack: `URL: ${videoData.initUrl}`
+        });
+      }
+    } catch (e) {
+      logError(METHOD, `Video init segment error`, e);
+    }
   }
 
   // Download audio init segment
   let audioInitData = null;
   if (audioData?.initUrl) {
     try {
-      const res = await fetch(audioData.initUrl);
-      if (res.ok) audioInitData = new Uint8Array(await res.arrayBuffer());
-    } catch (e) { console.error('Audio init failed:', e); }
+      log(METHOD, `Downloading audio init segment...`, { url: audioData.initUrl });
+      const res = await fetch(audioData.initUrl, buildFetchOptions(audioData.initUrl));
+      if (res.ok) {
+        audioInitData = new Uint8Array(await res.arrayBuffer());
+        log(METHOD, `Audio init segment downloaded`, { size: audioInitData.byteLength });
+      } else {
+        logError(METHOD, `Audio init segment fetch failed`, {
+          name: 'InitSegmentError',
+          message: `HTTP ${res.status}`,
+          stack: `URL: ${audioData.initUrl}`
+        });
+      }
+    } catch (e) {
+      logError(METHOD, `Audio init segment error`, e);
+    }
   }
 
   // Download video segments
   const videoSegments = [];
-  for (const url of videoData.segments) {
+  for (let i = 0; i < videoData.segments.length; i++) {
+    const url = videoData.segments[i];
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, buildFetchOptions(url));
       if (res.ok) {
         videoSegments.push(new Uint8Array(await res.arrayBuffer()));
         downloaded++;
         sendProgress(5 + Math.round((downloaded / totalSegments) * 80), `Downloading ${downloaded}/${totalSegments}`);
+      } else {
+        failedSegments.push({ type: 'video', index: i, url, status: res.status, statusText: res.statusText });
+        logError(METHOD, `Video segment ${i} failed`, {
+          name: 'SegmentFetchError',
+          message: `HTTP ${res.status} ${res.statusText}`,
+          stack: `URL: ${url}\nIndex: ${i}`
+        });
       }
-    } catch (e) { console.error('Video segment failed:', url); }
+    } catch (e) {
+      failedSegments.push({ type: 'video', index: i, url, error: e.message });
+      logError(METHOD, `Video segment ${i} network error`, e);
+    }
   }
 
   // Download audio segments
   const audioSegments = [];
   if (audioData) {
-    for (const url of audioData.segments) {
+    for (let i = 0; i < audioData.segments.length; i++) {
+      const url = audioData.segments[i];
       try {
-        const res = await fetch(url);
+        const res = await fetch(url, buildFetchOptions(url));
         if (res.ok) {
           audioSegments.push(new Uint8Array(await res.arrayBuffer()));
           downloaded++;
           sendProgress(5 + Math.round((downloaded / totalSegments) * 80), `Downloading ${downloaded}/${totalSegments}`);
+        } else {
+          failedSegments.push({ type: 'audio', index: i, url, status: res.status, statusText: res.statusText });
+          logError(METHOD, `Audio segment ${i} failed`, {
+            name: 'SegmentFetchError',
+            message: `HTTP ${res.status} ${res.statusText}`,
+            stack: `URL: ${url}\nIndex: ${i}`
+          });
         }
-      } catch (e) { console.error('Audio segment failed:', url); }
+      } catch (e) {
+        failedSegments.push({ type: 'audio', index: i, url, error: e.message });
+        logError(METHOD, `Audio segment ${i} network error`, e);
+      }
     }
+  }
+
+  log(METHOD, `Segment download summary`, {
+    videoDownloaded: videoSegments.length,
+    videoTotal: videoData.segments.length,
+    audioDownloaded: audioSegments.length,
+    audioTotal: audioData?.segments.length || 0,
+    failedCount: failedSegments.length
+  });
+
+  if (videoSegments.length === 0) {
+    const errorDetails = logError(METHOD, `All video segments failed`, {
+      name: 'AllSegmentsFailedError',
+      message: 'No video segments were downloaded successfully',
+      stack: `Failed segments: ${JSON.stringify(failedSegments.slice(0, 5))}`
+    });
+    sendProgress(0, "Error: All video segments failed", errorDetails);
+    return;
   }
 
   sendProgress(90, "Merging...");
@@ -203,28 +450,36 @@ async function downloadSegmentsWithAudio(videoPlaylistText, videoBaseUrl, audioP
   // Determine format and merge
   const firstVideoSeg = videoSegments[0];
   const isTsFormat = firstVideoSeg && firstVideoSeg[0] === 0x47;
+  log(METHOD, `Format detection`, { isTsFormat, firstByte: firstVideoSeg?.[0] });
 
   let finalBlob = null;
   let ext = 'mp4';
 
   if (isTsFormat) {
-    // TS format: mux.js can handle video+audio in same segments
+    log(METHOD, `Processing TS format with mux.js...`);
     finalBlob = await transmuxTsSegments([...videoSegments]);
     if (!finalBlob) {
+      log(METHOD, `mux.js transmux failed, saving as raw TS`);
       ext = 'ts';
       finalBlob = new Blob(videoSegments, { type: 'video/mp2t' });
     }
   } else {
-    // fMP4 format: merge video and audio tracks
+    log(METHOD, `Processing fMP4 format...`);
     finalBlob = mergeFmp4Tracks(videoInitData, videoSegments, audioInitData, audioSegments);
   }
 
   if (!finalBlob || finalBlob.size === 0) {
-    sendProgress(0, "Error: 0 Bytes");
+    const errorDetails = logError(METHOD, `Final blob is empty`, {
+      name: 'EmptyBlobError',
+      message: 'Merged video has 0 bytes',
+      stack: `VideoSegments: ${videoSegments.length}, AudioSegments: ${audioSegments.length}, Format: ${isTsFormat ? 'TS' : 'fMP4'}`
+    });
+    sendProgress(0, "Error: 0 Bytes - Merge failed", errorDetails);
     return;
   }
 
   sendProgress(100, "Saving...");
+  log(METHOD, `Download completed`, { filename: `${filename}.${ext}`, size: finalBlob.size, failedSegments: failedSegments.length });
 
   const blobUrl = URL.createObjectURL(finalBlob);
   const a = document.createElement('a');
@@ -254,27 +509,49 @@ function parseMediaPlaylist(text, baseUrl) {
 }
 
 async function transmuxTsSegments(segments) {
+  const METHOD = 'transmuxTsSegments';
+  log(METHOD, `Starting TS transmux`, { segmentCount: segments.length });
+
   try {
     const transmuxer = new muxjs.mp4.Transmuxer();
     const combinedData = [];
+    let transmuxErrors = [];
 
     transmuxer.on('data', (segment) => {
       const data = new Uint8Array(segment.initSegment.byteLength + segment.data.byteLength);
       data.set(segment.initSegment, 0);
       data.set(segment.data, segment.initSegment.byteLength);
       combinedData.push(data);
+      log(METHOD, `Transmuxed segment`, { initSize: segment.initSegment.byteLength, dataSize: segment.data.byteLength });
     });
 
-    for (const segment of segments) {
-      transmuxer.push(segment);
-      transmuxer.flush();
+    transmuxer.on('error', (error) => {
+      transmuxErrors.push(error);
+      logError(METHOD, `Transmuxer error event`, { name: 'TransmuxError', message: error.message || error, stack: '' });
+    });
+
+    for (let i = 0; i < segments.length; i++) {
+      try {
+        transmuxer.push(segments[i]);
+        transmuxer.flush();
+      } catch (segError) {
+        logError(METHOD, `Failed to transmux segment ${i}`, segError);
+      }
     }
 
     if (combinedData.length > 0) {
+      const totalSize = combinedData.reduce((sum, arr) => sum + arr.byteLength, 0);
+      log(METHOD, `Transmux completed`, { outputChunks: combinedData.length, totalSize });
       return new Blob(combinedData, { type: 'video/mp4' });
+    } else {
+      logError(METHOD, `No data produced by transmuxer`, {
+        name: 'TransmuxEmptyError',
+        message: 'mux.js produced no output data',
+        stack: `Input segments: ${segments.length}, Errors: ${transmuxErrors.length}`
+      });
     }
   } catch (e) {
-    console.warn('[Offscreen] TS transmux failed:', e);
+    logError(METHOD, `TS transmux failed`, e);
   }
   return null;
 }
@@ -473,6 +750,9 @@ function writeUint32(data, offset, value) {
 }
 
 async function downloadSegments(playlistText, baseUrl, filename) {
+  const METHOD = 'downloadSegments';
+  log(METHOD, `Starting segment download`, { baseUrl, filename });
+
   const lines = playlistText.split('\n');
   const segmentUrls = [];
   let initSegmentUrl = null;
@@ -486,7 +766,7 @@ async function downloadSegments(playlistText, baseUrl, filename) {
       const uriMatch = line.match(/URI="([^"]+)"/);
       if (uriMatch) {
         initSegmentUrl = new URL(uriMatch[1], baseUrl).href;
-        console.log('[Offscreen] Found init segment:', initSegmentUrl);
+        log(METHOD, `Found init segment`, { url: initSegmentUrl });
       }
     }
     // Collect media segment URLs (non-comment, non-empty lines)
@@ -496,40 +776,60 @@ async function downloadSegments(playlistText, baseUrl, filename) {
   }
 
   if (segmentUrls.length === 0) {
-    sendProgress(0, "Error: No segments found");
+    const errorDetails = logError(METHOD, `No segments found in playlist`, {
+      name: 'NoSegmentsError',
+      message: 'Playlist parsing produced 0 segment URLs',
+      stack: `Playlist lines: ${lines.length}\nBase URL: ${baseUrl}`
+    });
+    sendProgress(0, "Error: No segments found in playlist", errorDetails);
     return;
   }
 
+  log(METHOD, `Playlist parsed`, { segmentCount: segmentUrls.length, hasInit: !!initSegmentUrl });
   sendProgress(5, `Found ${segmentUrls.length} segs`);
+
+  // 세그먼트 도메인들에 대해 DNR 규칙 등록
+  await registerSegmentDomains(segmentUrls, initSegmentUrl);
 
   const segments = [];
   let initSegmentData = null;
+  let failedSegments = [];
 
   // Download init segment first if present (critical for fMP4)
   if (initSegmentUrl) {
     try {
-      console.log('[Offscreen] Downloading init segment...');
-      const initRes = await fetch(initSegmentUrl);
+      log(METHOD, `Downloading init segment...`);
+      const initRes = await fetch(initSegmentUrl, buildFetchOptions(initSegmentUrl));
       if (initRes.ok) {
         initSegmentData = new Uint8Array(await initRes.arrayBuffer());
-        console.log('[Offscreen] Init segment size:', initSegmentData.byteLength);
+        log(METHOD, `Init segment downloaded`, { size: initSegmentData.byteLength });
       } else {
-        console.warn('[Offscreen] Init segment failed:', initRes.status);
+        logError(METHOD, `Init segment fetch failed`, {
+          name: 'InitSegmentError',
+          message: `HTTP ${initRes.status} ${initRes.statusText}`,
+          stack: `URL: ${initSegmentUrl}`
+        });
       }
     } catch (e) {
-      console.error('[Offscreen] Init segment error:', e);
+      logError(METHOD, `Init segment network error`, e);
     }
   }
 
   let downloaded = 0;
   const total = segmentUrls.length;
 
-  for (const url of segmentUrls) {
+  for (let i = 0; i < segmentUrls.length; i++) {
+    const url = segmentUrls[i];
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, buildFetchOptions(url));
       if (!res.ok) {
-         console.warn(`Failed segment ${res.status}: ${url}`);
-         continue;
+        failedSegments.push({ index: i, url, status: res.status, statusText: res.statusText });
+        logError(METHOD, `Segment ${i} fetch failed`, {
+          name: 'SegmentFetchError',
+          message: `HTTP ${res.status} ${res.statusText}`,
+          stack: `URL: ${url}\nIndex: ${i}/${total}`
+        });
+        continue;
       }
       const buffer = await res.arrayBuffer();
       segments.push(new Uint8Array(buffer));
@@ -538,12 +838,24 @@ async function downloadSegments(playlistText, baseUrl, filename) {
       const percent = 5 + Math.round((downloaded / total) * 85);
       sendProgress(percent, `Downloading ${downloaded}/${total}`);
     } catch (e) {
-      console.error('Failed segment', url);
+      failedSegments.push({ index: i, url, error: e.message });
+      logError(METHOD, `Segment ${i} network error`, e);
     }
   }
 
+  log(METHOD, `Segment download summary`, {
+    downloaded: segments.length,
+    total: total,
+    failed: failedSegments.length
+  });
+
   if (segments.length === 0) {
-    sendProgress(0, "Error: All segments failed");
+    const errorDetails = logError(METHOD, `All segments failed to download`, {
+      name: 'AllSegmentsFailedError',
+      message: `0/${total} segments downloaded successfully`,
+      stack: `First 5 failures: ${JSON.stringify(failedSegments.slice(0, 5))}`
+    });
+    sendProgress(0, "Error: All segments failed to download", errorDetails);
     return;
   }
 
@@ -559,43 +871,27 @@ async function downloadSegments(playlistText, baseUrl, filename) {
     (firstSegment[4] === 0x73 && firstSegment[5] === 0x74 && firstSegment[6] === 0x79 && firstSegment[7] === 0x70) || // styp
     (firstSegment[4] === 0x6D && firstSegment[5] === 0x6F && firstSegment[6] === 0x6F && firstSegment[7] === 0x66);   // moof
 
-  console.log('[Offscreen] Format detection - TS:', isTsFormat, 'fMP4:', isFmp4Format);
+  log(METHOD, `Format detection`, {
+    isTsFormat,
+    isFmp4Format,
+    firstBytes: Array.from(firstSegment.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ')
+  });
 
   if (isTsFormat) {
-    // MPEG-TS format: use mux.js to transmux to MP4
-    try {
-      const transmuxer = new muxjs.mp4.Transmuxer();
-      const combinedData = [];
-
-      transmuxer.on('data', (segment) => {
-        const data = new Uint8Array(segment.initSegment.byteLength + segment.data.byteLength);
-        data.set(segment.initSegment, 0);
-        data.set(segment.data, segment.initSegment.byteLength);
-        combinedData.push(data);
-      });
-
-      for (const segment of segments) {
-        transmuxer.push(segment);
-        transmuxer.flush();
-      }
-
-      if (combinedData.length > 0) {
-        finalBlob = new Blob(combinedData, { type: 'video/mp4' });
-      } else {
-        throw new Error("No data from mux.js");
-      }
-    } catch (e) {
-      console.warn("[Offscreen] TS transmux failed, saving as .ts", e);
+    log(METHOD, `Processing as MPEG-TS format...`);
+    finalBlob = await transmuxTsSegments(segments);
+    if (!finalBlob) {
+      log(METHOD, `Transmux failed, saving as raw .ts`);
       ext = 'ts';
       finalBlob = new Blob(segments, { type: 'video/mp2t' });
     }
   } else if (isFmp4Format) {
-    // fMP4 format: concatenate init segment + media segments
+    log(METHOD, `Processing as fMP4 format...`);
     const allParts = [];
 
     if (initSegmentData) {
       allParts.push(initSegmentData);
-      console.log('[Offscreen] Prepending init segment');
+      log(METHOD, `Prepending init segment`);
     }
 
     for (const seg of segments) {
@@ -604,17 +900,27 @@ async function downloadSegments(playlistText, baseUrl, filename) {
 
     finalBlob = new Blob(allParts, { type: 'video/mp4' });
   } else {
-    // Unknown format: try raw concat
-    console.warn('[Offscreen] Unknown format, attempting raw concat');
+    log(METHOD, `Unknown format, attempting raw concat`);
     finalBlob = new Blob(segments, { type: 'video/mp4' });
   }
 
   if (!finalBlob || finalBlob.size === 0) {
-    sendProgress(0, "Error: 0 Bytes");
+    const errorDetails = logError(METHOD, `Final output is empty`, {
+      name: 'EmptyOutputError',
+      message: 'Merged file has 0 bytes',
+      stack: `Segments: ${segments.length}, Init: ${!!initSegmentData}, Format: ${isTsFormat ? 'TS' : isFmp4Format ? 'fMP4' : 'Unknown'}`
+    });
+    sendProgress(0, "Error: Output file is 0 bytes", errorDetails);
     return;
   }
 
   sendProgress(100, "Saving...");
+  log(METHOD, `Download completed successfully`, {
+    filename: `${filename}.${ext}`,
+    size: finalBlob.size,
+    format: ext,
+    failedSegments: failedSegments.length
+  });
 
   const blobUrl = URL.createObjectURL(finalBlob);
   const a = document.createElement('a');

@@ -26,17 +26,43 @@ let activeStatusEl = null;
 
 function updateProgressUI(message) {
   if (!activeDownloadBtn || !activeStatusEl) return;
-  
-  const { percent, status } = message;
-  
+
+  const { percent, status, errorDetails } = message;
+
   // Error Handling -> Fallback to Copy Command
   if (status.startsWith("Error")) {
-    activeStatusEl.textContent = "Failed. Copied yt-dlp cmd!";
-    activeStatusEl.style.color = "#ef4444"; 
-    
+    // 콘솔에 상세 오류 로그 출력
+    console.error('[Popup] Download failed:', status);
+    if (errorDetails) {
+      console.error('[Popup] Error Details:', {
+        timestamp: errorDetails.timestamp,
+        method: errorDetails.method,
+        message: errorDetails.message,
+        errorName: errorDetails.errorName,
+        errorMessage: errorDetails.errorMessage
+      });
+      console.error('[Popup] Stack Trace:', errorDetails.errorStack);
+    }
+
+    // 사용자에게 표시할 간단한 오류 메시지
+    let displayMessage = "Failed";
+    if (errorDetails) {
+      if (errorDetails.errorName === 'HTTPError') {
+        displayMessage = `HTTP ${errorDetails.errorMessage.split(' ')[1]} Error`;
+      } else if (errorDetails.errorName === 'AllSegmentsFailedError') {
+        displayMessage = "All segments failed";
+      } else if (errorDetails.errorMessage.includes('Network')) {
+        displayMessage = "Network error";
+      } else if (errorDetails.errorMessage.includes('CORS')) {
+        displayMessage = "CORS blocked";
+      }
+    }
+
+    activeStatusEl.textContent = `${displayMessage}. Copied cmd!`;
+    activeStatusEl.style.color = "#ef4444";
+
     // Copy yt-dlp command to clipboard
     const url = activeDownloadBtn.dataset.url;
-    // We assume standard headers for Twitter/General
     const cmd = `yt-dlp "${url}" --referer "https://twitter.com/"`;
     navigator.clipboard.writeText(cmd);
 
@@ -49,7 +75,12 @@ function updateProgressUI(message) {
       </svg>
     `;
     activeDownloadBtn.style.background = '#ef4444';
-    
+
+    // 오류 상세 정보 툴팁 추가
+    if (errorDetails) {
+      activeDownloadBtn.title = `Error: ${errorDetails.errorMessage}\nMethod: ${errorDetails.method}\nCheck console (F12) for details`;
+    }
+
   } else if (percent >= 100) {
     activeStatusEl.textContent = "Done!";
     activeStatusEl.style.color = "#10b981";
@@ -60,6 +91,7 @@ function updateProgressUI(message) {
     `;
     activeDownloadBtn.classList.remove('downloading');
     activeDownloadBtn.style.background = '#10b981';
+    activeDownloadBtn.title = 'Download completed';
   } else {
     activeStatusEl.textContent = status;
     activeStatusEl.style.color = "#f59e0b";
