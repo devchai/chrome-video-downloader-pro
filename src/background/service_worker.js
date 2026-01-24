@@ -234,6 +234,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       ruledDomains.add(domain);
     }
     return false;
+  }
+
+  // Offscreen → Popup 메시지 중계 (진행률 표시)
+  // sender.url로 offscreen document에서 온 메시지인지 확인
+  if (request.action === "downloadProgress" && sender.url?.includes('offscreen')) {
+    // Service Worker가 받은 메시지를 다시 broadcast하여 popup이 받을 수 있게 함
+    chrome.runtime.sendMessage(request).catch(() => {
+      // popup이 닫혀있으면 에러 무시
+    });
+    return false;
   } 
   
   else if (request.action === "downloadVideo") {

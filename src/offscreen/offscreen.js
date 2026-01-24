@@ -54,7 +54,7 @@ function sendProgress(percent, status, errorDetails = null) {
 async function processDirectDownload(url, filename) {
   const METHOD = 'processDirectDownload';
   log(METHOD, `Starting direct download`, { url, filename, referer: currentReferer });
-  sendProgress(10, "Starting...");
+  sendProgress(5, "Connecting...");
 
   try {
     // Referer 헤더를 포함한 fetch 옵션
@@ -72,13 +72,53 @@ async function processDirectDownload(url, filename) {
       return;
     }
 
+    const contentLength = response.headers.get('content-length');
+    const totalSize = contentLength ? parseInt(contentLength, 10) : 0;
+
     log(METHOD, `Response received`, {
       status: response.status,
       contentType: response.headers.get('content-type'),
-      contentLength: response.headers.get('content-length')
+      contentLength: totalSize
     });
 
-    const blob = await response.blob();
+    // ReadableStream으로 진행률 추적
+    let receivedSize = 0;
+    const chunks = [];
+    const reader = response.body.getReader();
+    let lastProgressUpdate = 0;
+    const PROGRESS_UPDATE_INTERVAL = 200; // 200ms마다 업데이트
+
+    sendProgress(10, "Downloading...");
+
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      chunks.push(value);
+      receivedSize += value.length;
+
+      // 진행률 업데이트 빈도 제한 (200ms마다)
+      const now = Date.now();
+      if (now - lastProgressUpdate >= PROGRESS_UPDATE_INTERVAL) {
+        lastProgressUpdate = now;
+
+        // 진행률 계산 (10% ~ 90% 범위)
+        if (totalSize > 0) {
+          const percent = Math.round(10 + (receivedSize / totalSize) * 80);
+          const downloaded = (receivedSize / 1024 / 1024).toFixed(1);
+          const total = (totalSize / 1024 / 1024).toFixed(1);
+          sendProgress(percent, `${downloaded}/${total} MB`);
+        } else {
+          // Content-Length가 없는 경우 다운로드된 크기만 표시
+          const downloaded = (receivedSize / 1024 / 1024).toFixed(1);
+          sendProgress(50, `${downloaded} MB...`);
+        }
+      }
+    }
+
+    // chunks를 Blob으로 합치기
+    const blob = new Blob(chunks);
     log(METHOD, `Blob created`, { size: blob.size, type: blob.type });
 
     if (blob.size === 0) {
