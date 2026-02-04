@@ -44,5 +44,8 @@
       "resources": ["src/offscreen/offscreen.html"],
       "matches": ["<all_urls>"]
     }
-  ]
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' data: https: http:;"
+  }
 }
