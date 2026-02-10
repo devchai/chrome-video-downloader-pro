@@ -1,12 +1,13 @@
 document.addEventListener('DOMContentLoaded', async () => {
   const container = document.getElementById('video-list');
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  
+
   if (!tab) return;
 
-  // 1. Listen for progress/status
+  // 1. Listen for progress/status (URL 기반 매칭)
   chrome.runtime.onMessage.addListener((message) => {
     if (message.action === "downloadProgress") {
+      if (message.url) receivedRealTimeUrls.add(message.url);
       updateProgressUI(message);
     }
   });
@@ -15,23 +16,27 @@ document.addEventListener('DOMContentLoaded', async () => {
   chrome.runtime.sendMessage({ action: "getVideos", tabId: tab.id }, (response) => {
     if (response && response.videos && response.videos.length > 0) {
       renderVideos(response.videos, tab.title);
+      restoreDownloadStates();
     } else {
       container.innerHTML = '<div class="empty-state"><p>No network videos detected.</p><p class="sub-text">Play a video to capture traffic.</p></div>';
     }
   });
 });
 
-let activeDownloadBtn = null;
-let activeStatusEl = null;
+// URL → { btn, statusEl } 매핑 (팝업 재오픈 시에도 동기화 가능)
+let downloadUIMap = {};
+// 실시간 메시지를 받은 URL 추적 (restore 시 stale 데이터 방지)
+let receivedRealTimeUrls = new Set();
 
 function updateProgressUI(message) {
-  if (!activeDownloadBtn || !activeStatusEl) return;
+  const { url, percent, status, errorDetails } = message;
+  const ui = url ? downloadUIMap[url] : null;
+  if (!ui || !status) return;
 
-  const { percent, status, errorDetails } = message;
+  const { btn, statusEl } = ui;
 
   // Error Handling -> Fallback to Copy Command
   if (status.startsWith("Error")) {
-    // 콘솔에 상세 오류 로그 출력
     console.error('[Popup] Download failed:', status);
     if (errorDetails) {
       console.error('[Popup] Error Details:', {
@@ -44,7 +49,6 @@ function updateProgressUI(message) {
       console.error('[Popup] Stack Trace:', errorDetails.errorStack);
     }
 
-    // 사용자에게 표시할 간단한 오류 메시지
     let displayMessage = "Failed";
     if (errorDetails) {
       if (errorDetails.errorName === 'HTTPError') {
@@ -58,60 +62,72 @@ function updateProgressUI(message) {
       }
     }
 
-    activeStatusEl.textContent = `${displayMessage}. Copied cmd!`;
-    activeStatusEl.style.color = "#ef4444";
+    statusEl.textContent = `${displayMessage}. Copied cmd!`;
+    statusEl.style.color = "#ef4444";
 
-    // Copy yt-dlp command to clipboard
-    const url = activeDownloadBtn.dataset.url;
     const cmd = `yt-dlp "${url}" --referer "https://twitter.com/"`;
     navigator.clipboard.writeText(cmd);
 
-    activeDownloadBtn.classList.remove('downloading');
-    activeDownloadBtn.innerHTML = `
+    btn.classList.remove('downloading');
+    btn.innerHTML = `
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
         <line x1="12" y1="9" x2="12" y2="13"></line>
         <line x1="12" y1="17" x2="12.01" y2="17"></line>
       </svg>
     `;
-    activeDownloadBtn.style.background = '#ef4444';
+    btn.style.background = '#ef4444';
 
-    // 오류 상세 정보 툴팁 추가
     if (errorDetails) {
-      activeDownloadBtn.title = `Error: ${errorDetails.errorMessage}\nMethod: ${errorDetails.method}\nCheck console (F12) for details`;
+      btn.title = `Error: ${errorDetails.errorMessage}\nMethod: ${errorDetails.method}\nCheck console (F12) for details`;
     }
 
   } else if (percent >= 100) {
-    activeStatusEl.textContent = "Done!";
-    activeStatusEl.style.color = "#10b981";
-    activeDownloadBtn.innerHTML = `
+    statusEl.textContent = "Done!";
+    statusEl.style.color = "#10b981";
+    btn.innerHTML = `
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polyline points="20 6 9 17 4 12"></polyline>
       </svg>
     `;
-    activeDownloadBtn.classList.remove('downloading');
-    activeDownloadBtn.style.background = '#10b981';
-    activeDownloadBtn.title = 'Download completed';
+    btn.classList.remove('downloading');
+    btn.style.background = '#10b981';
+    btn.title = 'Download completed';
   } else {
-    activeStatusEl.textContent = status;
-    activeStatusEl.style.color = "#f59e0b";
-    activeDownloadBtn.innerHTML = `<span style="font-size:10px; font-weight:bold">${percent}%</span>`;
-    activeDownloadBtn.style.background = '#f59e0b';
+    statusEl.textContent = status;
+    statusEl.style.color = "#f59e0b";
+    btn.classList.add('downloading');
+    btn.innerHTML = `<span style="font-size:10px; font-weight:bold">${percent}%</span>`;
+    btn.style.background = '#f59e0b';
   }
+}
+
+// 팝업 재오픈 시 Service Worker에서 활성 다운로드 상태 복원
+function restoreDownloadStates() {
+  chrome.runtime.sendMessage({ action: "getDownloadStates" }, (response) => {
+    if (!response || !response.states) return;
+    for (const [url, state] of Object.entries(response.states)) {
+      // 이미 실시간 메시지를 받은 URL은 스킵 (더 최신 데이터 유지)
+      if (downloadUIMap[url] && !receivedRealTimeUrls.has(url)) {
+        updateProgressUI({ url, ...state });
+      }
+    }
+  });
 }
 
 function renderVideos(videos, pageTitle) {
   const container = document.getElementById('video-list');
   container.innerHTML = '';
+  downloadUIMap = {};
 
   videos.forEach((video, index) => {
     const card = document.createElement('div');
     card.className = 'video-card';
-    
+
     const isHLS = video.contentType.includes('mpegurl') || video.contentType.includes('dash') || video.contentType.includes('octet-stream');
     const format = isHLS ? 'HLS/Stream' : video.contentType.split('/')[1].toUpperCase();
-    const sizeStr = video.size > 0 
-      ? (video.size / 1024 / 1024).toFixed(1) + ' MB' 
+    const sizeStr = video.size > 0
+      ? (video.size / 1024 / 1024).toFixed(1) + ' MB'
       : 'Stream';
 
     const urlParts = video.url.split('/');
@@ -148,43 +164,33 @@ function renderVideos(videos, pageTitle) {
     `;
 
     container.appendChild(card);
-    
-    // CMD Copy Logic (Manual)
+
+    const btn = card.querySelector('.download-btn');
+    const statusEl = card.querySelector('.status-text');
+
+    // URL → UI 요소 매핑 등록 (팝업 재오픈 시 상태 복원용)
+    downloadUIMap[video.url] = { btn, statusEl };
+
+    // CMD Copy Logic
     const cmdBtn = card.querySelector('.cmd-btn');
     cmdBtn.addEventListener('click', () => {
       const cmd = `yt-dlp "${video.url}" --referer "https://twitter.com/"`;
       navigator.clipboard.writeText(cmd);
-      const status = card.querySelector('.status-text');
-      status.textContent = "Copied yt-dlp command!";
-      status.style.color = "#a78bfa";
+      statusEl.textContent = "Copied yt-dlp command!";
+      statusEl.style.color = "#a78bfa";
       setTimeout(() => {
-        status.textContent = "Ready";
-        status.style.color = "#64748b";
+        statusEl.textContent = "Ready";
+        statusEl.style.color = "#64748b";
       }, 2000);
     });
 
-    // Download Logic (Auto fallback)
-    const btn = card.querySelector('.download-btn');
-    btn.addEventListener('click', (e) => {
-      if (activeDownloadBtn && activeDownloadBtn !== btn) {
-        // Reset previous
-        activeDownloadBtn.innerHTML = `
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-            <polyline points="7 10 12 15 17 10"></polyline>
-            <line x1="12" y1="15" x2="12" y2="3"></line>
-          </svg>`;
-        activeDownloadBtn.style.background = '#3b82f6';
-      }
-
-      activeDownloadBtn = btn;
-      activeStatusEl = card.querySelector('.status-text');
-      
+    // Download Logic
+    btn.addEventListener('click', () => {
       btn.classList.add('downloading');
-      btn.innerHTML = '...'; 
-      activeStatusEl.textContent = "Trying...";
-      activeStatusEl.style.color = "#f59e0b";
-      
+      btn.innerHTML = '...';
+      statusEl.textContent = "Trying...";
+      statusEl.style.color = "#f59e0b";
+
       handleDownload(video, pageTitle);
     });
   });

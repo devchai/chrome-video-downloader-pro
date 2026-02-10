@@ -8,6 +8,9 @@ let urlReferers = {};
 let ruledDomains = new Set();
 let nextRuleId = 1001;
 
+// 다운로드 진행 상태 추적 (팝업 재오픈 시 동기화용)
+let downloadStates = {}; // { [url]: { percent, status, errorDetails } }
+
 const TARGET_MIME_TYPES = new Set([
   'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime',
   'video/x-flv', 'video/x-msvideo', 'video/3gpp',
@@ -226,6 +229,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  // 팝업에서 활성 다운로드 상태 요청
+  if (request.action === "getDownloadStates") {
+    // Lazy cleanup: 60초 이상 지난 완료/에러 상태 정리
+    const now = Date.now();
+    for (const [url, state] of Object.entries(downloadStates)) {
+      if (state._completedAt && (now - state._completedAt > 60000)) {
+        delete downloadStates[url];
+      }
+    }
+    sendResponse({ states: downloadStates });
+    return true;
+  }
+
   // Offscreen에서 새 도메인 규칙 요청
   if (request.action === "addDomainRule") {
     const { domain, referer } = request;
@@ -237,30 +253,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   // Offscreen → Popup 메시지 중계 (진행률 표시)
-  // sender.url로 offscreen document에서 온 메시지인지 확인
   if (request.action === "downloadProgress" && sender.url?.includes('offscreen')) {
-    // Service Worker가 받은 메시지를 다시 broadcast하여 popup이 받을 수 있게 함
-    chrome.runtime.sendMessage(request).catch(() => {
-      // popup이 닫혀있으면 에러 무시
-    });
+    const url = request.url;
+    if (url) {
+      downloadStates[url] = {
+        percent: request.percent,
+        status: request.status,
+        errorDetails: request.errorDetails || null
+      };
+
+      // 완료/에러 상태: 타임스탬프 기록 후 lazy cleanup
+      if (request.percent >= 100 || request.status?.startsWith("Error")) {
+        downloadStates[url]._completedAt = Date.now();
+      }
+    }
+
+    // popup에 중계
+    chrome.runtime.sendMessage(request).catch(() => {});
     return false;
-  } 
-  
+  }
+
   else if (request.action === "downloadVideo") {
     const { url, filename, contentType } = request;
     const cleanFilename = sanitizeFilename(filename);
 
+    // 다운로드 상태 초기화
+    downloadStates[url] = { percent: 0, status: "Starting..." };
+
     // Get the best referer we have
     let referer = urlReferers[url];
     if (!referer) {
-       // Try matching pathname
        const pathKey = new URL(url).pathname;
        referer = urlReferers[pathKey];
     }
-    // Fallback to initiator of the tab if possible (hard to get here)
-    // Or just use origin of the video url as fallback (often wrong for CDN)
-    
-    // Pass referer to offscreen via message, or set global rule
+
     if (referer) {
        setDynamicRules(url, referer);
     }
@@ -271,7 +297,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           action: "processHLS",
           url: url,
           filename: cleanFilename,
-          referer: referer // Explicitly pass referer
+          referer: referer
         });
       });
     } else {

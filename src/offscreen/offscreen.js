@@ -1,14 +1,17 @@
 // Offscreen Document for HLS & Direct Processing
 
-// 전역 referer 저장 (세그먼트 다운로드에서 사용)
+// 전역 상태 저장
 let currentReferer = null;
+let currentDownloadUrl = null; // 진행률 메시지에 URL 포함용
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "processHLS") {
     currentReferer = request.referer || null;
+    currentDownloadUrl = request.url;
     processHLS(request.url, request.filename);
   } else if (request.action === "downloadDirect") {
     currentReferer = request.referer || null;
+    currentDownloadUrl = request.url;
     processDirectDownload(request.url, request.filename);
   }
 });
@@ -42,6 +45,7 @@ function logError(method, msg, error = null) {
 function sendProgress(percent, status, errorDetails = null) {
   const message = {
     action: "downloadProgress",
+    url: currentDownloadUrl,
     percent: percent,
     status: status
   };
