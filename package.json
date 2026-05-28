@@ -1,0 +1,9 @@
+{
+  "name": "chrome-video-downloader-pro",
+  "version": "1.0.1",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/background/service_worker.js && node --check src/offscreen/offscreen.js && node --check src/popup/popup.js && node --check src/content/content_script.js && node --check src/shared/video_utils.js && node --check src/shared/logger_manager.js"
+  }
+}

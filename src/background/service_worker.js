@@ -1,4 +1,6 @@
 // Background Service Worker
+importScripts('../shared/logger_manager.js');
+importScripts('../shared/video_utils.js');
 importScripts('../assets/lib/mux.min.js');
 
 let detectedVideos = {};
@@ -7,26 +9,42 @@ let urlReferers = {};
 // DNR 규칙이 적용된 도메인 추적
 let ruledDomains = new Set();
 let nextRuleId = 1001;
+let dynamicRuleIds = [];
 
 // 다운로드 진행 상태 추적 (팝업 재오픈 시 동기화용)
 let downloadStates = {}; // { [url]: { percent, status, errorDetails } }
 
-const TARGET_MIME_TYPES = new Set([
-  'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime',
-  'video/x-flv', 'video/x-msvideo', 'video/3gpp',
-  'application/x-mpegurl', 'application/vnd.apple.mpegurl',
-  'video/mp2t', 'application/dash+xml', 'binary/octet-stream'
-]);
+const LOG_CLASS = 'ServiceWorker';
+const SESSION_KEYS = ['detectedVideos', 'urlReferers', 'downloadStates', 'dynamicRuleIds', 'nextRuleId'];
 
-const BLOCKED_DOMAINS = ['youtube.com', 'googlevideo.com', 'youtu.be'];
+const stateReady = loadSessionState();
 
-function isBlocked(url) {
+async function loadSessionState() {
   try {
-    const hostname = new URL(url).hostname;
-    return BLOCKED_DOMAINS.some(domain => hostname.includes(domain));
+    const state = await chrome.storage.session.get(SESSION_KEYS);
+    detectedVideos = state.detectedVideos || {};
+    urlReferers = state.urlReferers || {};
+    downloadStates = state.downloadStates || {};
+    dynamicRuleIds = state.dynamicRuleIds || [];
+    nextRuleId = state.nextRuleId || 1001;
   } catch (e) {
-    return false;
+    LoggerManager.error(LOG_CLASS, 'loadSessionState', 'Failed to load session state', e);
   }
+}
+
+function persistSessionState(keys = SESSION_KEYS) {
+  const state = {};
+  for (const key of keys) {
+    if (key === 'detectedVideos') state.detectedVideos = detectedVideos;
+    if (key === 'urlReferers') state.urlReferers = urlReferers;
+    if (key === 'downloadStates') state.downloadStates = downloadStates;
+    if (key === 'dynamicRuleIds') state.dynamicRuleIds = dynamicRuleIds;
+    if (key === 'nextRuleId') state.nextRuleId = nextRuleId;
+  }
+
+  chrome.storage.session.set(state).catch((e) => {
+    LoggerManager.error(LOG_CLASS, 'persistSessionState', 'Failed to persist session state', e);
+  });
 }
 
 function updateBadge(tabId) {
@@ -34,14 +52,6 @@ function updateBadge(tabId) {
   const text = count > 0 ? count.toString() : '';
   chrome.action.setBadgeText({ text, tabId });
   chrome.action.setBadgeBackgroundColor({ color: '#3b82f6', tabId });
-}
-
-function sanitizeFilename(name) {
-  if (!name) return 'video_download';
-  let clean = name.replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/_+/g, '_');
-  if (clean.length > 50) clean = clean.substring(0, 50);
-  if (clean === '' || clean === '_') return 'video_' + Date.now();
-  return clean;
 }
 
 async function ensureOffscreenDocument() {
@@ -62,9 +72,10 @@ async function ensureOffscreenDocument() {
 async function setDynamicRules(targetUrl, referer) {
   const targetDomain = new URL(targetUrl).hostname;
 
-  // Clean existing dynamic rules
+  // Clean existing dynamic rules, including rules from previous downloads.
+  const removeRuleIds = Array.from(new Set([999, 1000, ...dynamicRuleIds]));
   await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [999, 1000]
+    removeRuleIds
   });
 
   const rules = [];
@@ -113,12 +124,16 @@ async function setDynamicRules(targetUrl, referer) {
     addRules: rules
   });
 
-  console.log(`[DNR] Rules updated for ${targetDomain} with Referer: ${referer}`);
-  console.log(`[DNR] Active rules:`, rules.length);
+  LoggerManager.debug(LOG_CLASS, 'setDynamicRules', `Rules updated for ${targetDomain}`, {
+    referer,
+    ruleCount: rules.length
+  });
 
   // 초기 도메인 추적
   ruledDomains = new Set([targetDomain]);
   nextRuleId = 1001;
+  dynamicRuleIds = rules.map(rule => rule.id);
+  persistSessionState(['dynamicRuleIds', 'nextRuleId']);
 }
 
 // 추가 도메인에 대한 규칙 동적 추가 (HLS 세그먼트가 다른 CDN에 있을 때)
@@ -144,9 +159,11 @@ async function addDomainRule(domain, referer) {
       }]
     });
 
-    console.log(`[DNR] Added rule ${ruleId} for new domain: ${domain}`);
+    dynamicRuleIds.push(ruleId);
+    persistSessionState(['dynamicRuleIds', 'nextRuleId']);
+    LoggerManager.debug(LOG_CLASS, 'addDomainRule', `Added rule ${ruleId} for new domain`, { domain });
   } catch (e) {
-    console.error(`[DNR] Failed to add rule for ${domain}:`, e);
+    LoggerManager.error(LOG_CLASS, 'addDomainRule', `Failed to add rule for ${domain}`, e);
   }
 }
 
@@ -154,168 +171,206 @@ async function addDomainRule(domain, referer) {
 // 2. Capture Referer on Initial Request
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
-    if (details.tabId === -1) return;
-    const referer = details.requestHeaders.find(h => h.name.toLowerCase() === 'referer');
-    if (referer) {
-      urlReferers[details.url] = referer.value;
-      // Also cache by domain/path loosely to match video fragments
-      const pathKey = new URL(details.url).pathname;
-      urlReferers[pathKey] = referer.value;
-    }
+    stateReady.then(() => captureReferer(details));
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders"]
+  ["requestHeaders", "extraHeaders"]
 );
+
+function captureReferer(details) {
+  if (details.tabId === -1 || !details.requestHeaders) return;
+  const referer = details.requestHeaders.find(h => h.name.toLowerCase() === 'referer');
+  if (referer) {
+    urlReferers[details.url] = referer.value;
+    // Also cache by domain/path loosely to match video fragments
+    const pathKey = new URL(details.url).pathname;
+    urlReferers[pathKey] = referer.value;
+    persistSessionState(['urlReferers']);
+  }
+}
 
 // 3. Detect Video
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    if (details.tabId === -1 || details.method !== 'GET') return;
-    if (isBlocked(details.url) || isBlocked(details.initiator)) return;
-
-    const contentTypeHeader = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-type');
-    if (!contentTypeHeader) return;
-    
-    const contentType = contentTypeHeader.value.split(';')[0].toLowerCase().trim();
-
-    if (TARGET_MIME_TYPES.has(contentType)) {
-      const contentLengthHeader = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-length');
-      const size = contentLengthHeader ? parseInt(contentLengthHeader.value) : 0;
-
-      // Filter: Ignore small files unless it looks like a playlist
-      // M3U8, XML (DASH), or octet-stream (often fragments)
-      if (!contentType.includes('mpegurl') && !contentType.includes('xml') && size > 0 && size < 5120) return;
-
-      // Heuristic: If it's a small octet-stream, it might be just a fragment, not the full video.
-      // But we can't be sure. Let's list it anyway for now.
-
-      const videoData = {
-        url: details.url,
-        contentType: contentType,
-        size: size,
-        timestamp: Date.now(),
-        tabId: details.tabId,
-        thumbnail: null
-      };
-
-      if (!detectedVideos[details.tabId]) {
-        detectedVideos[details.tabId] = [];
-      }
-
-      const isDuplicate = detectedVideos[details.tabId].some(v => v.url === videoData.url);
-      if (!isDuplicate) {
-        // Try to find referer
-        if (!urlReferers[videoData.url] && details.initiator) {
-           urlReferers[videoData.url] = details.initiator;
-        }
-
-        console.log('Video Detected:', videoData);
-        detectedVideos[details.tabId].push(videoData);
-        updateBadge(details.tabId);
-
-        // 썸네일 추출 요청
-        fetchThumbnailFromTab(details.tabId, videoData.url);
-      }
-    }
+    stateReady.then(() => detectVideo(details));
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
 );
 
+function detectVideo(details) {
+  if (details.tabId === -1 || details.method !== 'GET') return;
+  if (VideoUtils.isBlockedUrl(details.url) || VideoUtils.isBlockedUrl(details.initiator)) return;
+
+  const contentTypeHeader = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-type');
+  if (!contentTypeHeader) return;
+
+  const contentType = VideoUtils.normalizeContentType(contentTypeHeader.value);
+
+  if (!VideoUtils.isTargetVideoContentType(contentType)) return;
+
+  const contentLengthHeader = details.responseHeaders.find(h => h.name.toLowerCase() === 'content-length');
+  const size = contentLengthHeader ? parseInt(contentLengthHeader.value) : 0;
+
+  if (VideoUtils.shouldIgnoreBySize(contentType, size)) return;
+
+  const videoData = {
+    url: details.url,
+    contentType: contentType,
+    size: size,
+    timestamp: Date.now(),
+    tabId: details.tabId,
+    thumbnail: null,
+    referer: urlReferers[details.url] || details.initiator || null
+  };
+
+  if (!detectedVideos[details.tabId]) {
+    detectedVideos[details.tabId] = [];
+  }
+
+  const isDuplicate = detectedVideos[details.tabId].some(v => v.url === videoData.url);
+  if (isDuplicate) return;
+
+  if (!urlReferers[videoData.url] && details.initiator) {
+    urlReferers[videoData.url] = details.initiator;
+  }
+
+  LoggerManager.debug(LOG_CLASS, 'detectVideo', 'Video detected', videoData);
+  detectedVideos[details.tabId].push(videoData);
+  persistSessionState(['detectedVideos', 'urlReferers']);
+  updateBadge(details.tabId);
+
+  // 썸네일 추출 요청
+  fetchThumbnailFromTab(details.tabId, videoData.url);
+}
+
 // 4. Handle Messages & Download
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "getVideos") {
-    sendResponse({ videos: detectedVideos[request.tabId] || [] });
+    stateReady.then(() => {
+      sendResponse({ videos: detectedVideos[request.tabId] || [] });
+    });
     return true;
   }
 
   // 팝업에서 활성 다운로드 상태 요청
   if (request.action === "getDownloadStates") {
-    // Lazy cleanup: 60초 이상 지난 완료/에러 상태 정리
-    const now = Date.now();
-    for (const [url, state] of Object.entries(downloadStates)) {
-      if (state._completedAt && (now - state._completedAt > 60000)) {
-        delete downloadStates[url];
+    stateReady.then(() => {
+      // Lazy cleanup: 60초 이상 지난 완료/에러 상태 정리
+      const now = Date.now();
+      let changed = false;
+      for (const [url, state] of Object.entries(downloadStates)) {
+        if (state._completedAt && (now - state._completedAt > 60000)) {
+          delete downloadStates[url];
+          changed = true;
+        }
       }
-    }
-    sendResponse({ states: downloadStates });
+      if (changed) persistSessionState(['downloadStates']);
+      sendResponse({ states: downloadStates });
+    });
     return true;
   }
 
   // Offscreen에서 새 도메인 규칙 요청
   if (request.action === "addDomainRule") {
     const { domain, referer } = request;
-    if (domain && referer && !ruledDomains.has(domain)) {
-      addDomainRule(domain, referer);
-      ruledDomains.add(domain);
-    }
+    stateReady.then(() => {
+      if (domain && referer && !ruledDomains.has(domain)) {
+        addDomainRule(domain, referer);
+        ruledDomains.add(domain);
+      }
+    });
     return false;
   }
 
   // Offscreen → Popup 메시지 중계 (진행률 표시)
   if (request.action === "downloadProgress" && sender.url?.includes('offscreen')) {
-    const url = request.url;
-    if (url) {
-      downloadStates[url] = {
-        percent: request.percent,
-        status: request.status,
-        errorDetails: request.errorDetails || null
-      };
-
-      // 완료/에러 상태: 타임스탬프 기록 후 lazy cleanup
-      if (request.percent >= 100 || request.status?.startsWith("Error")) {
-        downloadStates[url]._completedAt = Date.now();
-      }
-    }
-
-    // popup에 중계
-    chrome.runtime.sendMessage(request).catch(() => {});
+    stateReady.then(() => {
+      recordDownloadProgress(request);
+    });
     return false;
   }
 
   else if (request.action === "downloadVideo") {
-    const { url, filename, contentType } = request;
-    const cleanFilename = sanitizeFilename(filename);
-
-    // 다운로드 상태 초기화
-    downloadStates[url] = { percent: 0, status: "Starting..." };
-
-    // Get the best referer we have
-    let referer = urlReferers[url];
-    if (!referer) {
-       const pathKey = new URL(url).pathname;
-       referer = urlReferers[pathKey];
-    }
-
-    if (referer) {
-       setDynamicRules(url, referer);
-    }
-
-    if (contentType.includes('mpegurl') || contentType.includes('application/dash+xml')) {
-      ensureOffscreenDocument().then(() => {
-        chrome.runtime.sendMessage({
-          action: "processHLS",
-          url: url,
-          filename: cleanFilename,
-          referer: referer
-        });
-      });
-    } else {
-      console.log("Downloading Direct via Offscreen...");
-      ensureOffscreenDocument().then(() => {
-        chrome.runtime.sendMessage({
-          action: "downloadDirect",
-          url: url,
-          filename: cleanFilename,
-          referer: referer
-        });
-      });
-    }
+    stateReady.then(() => downloadVideo(request));
+    return false;
   }
 });
 
+function recordDownloadProgress(message) {
+  const url = message.url;
+  if (url) {
+    downloadStates[url] = {
+      percent: message.percent,
+      status: message.status,
+      errorDetails: message.errorDetails || null
+    };
+
+    // 완료/에러 상태: 타임스탬프 기록 후 lazy cleanup
+    if (message.percent >= 100 || message.status?.startsWith("Error")) {
+      downloadStates[url]._completedAt = Date.now();
+    }
+    persistSessionState(['downloadStates']);
+  }
+
+  // popup에 중계
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
+async function downloadVideo(request) {
+  const { url, filename, contentType } = request;
+  const cleanFilename = VideoUtils.sanitizeFilename(filename);
+
+  // 다운로드 상태 초기화
+  downloadStates[url] = { percent: 0, status: "Starting..." };
+  persistSessionState(['downloadStates']);
+
+  // Get the best referer we have
+  let referer = urlReferers[url];
+  if (!referer) {
+    const pathKey = new URL(url).pathname;
+    referer = urlReferers[pathKey];
+  }
+
+  if (referer) {
+    await setDynamicRules(url, referer);
+  }
+
+  if (VideoUtils.isDashContentType(contentType)) {
+    const errorDetails = {
+      timestamp: new Date().toISOString(),
+      method: 'downloadVideo',
+      message: 'DASH streams are detected but not supported yet',
+      errorName: 'UnsupportedDashError',
+      errorMessage: 'DASH download is not implemented',
+      errorStack: `URL: ${url}`
+    };
+    recordDownloadProgress({
+      action: 'downloadProgress',
+      url,
+      percent: 0,
+      status: 'Error: DASH streams are not supported yet',
+      errorDetails
+    });
+    return;
+  }
+
+  await ensureOffscreenDocument();
+  chrome.runtime.sendMessage({
+    action: VideoUtils.isHlsLikeContentType(contentType) ? "processHLS" : "downloadDirect",
+    url: url,
+    filename: cleanFilename,
+    referer: referer
+  });
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (detectedVideos[tabId]) delete detectedVideos[tabId];
+  stateReady.then(() => {
+    if (detectedVideos[tabId]) {
+      delete detectedVideos[tabId];
+      persistSessionState(['detectedVideos']);
+    }
+  });
 });
 
 // 썸네일 추출 함수
@@ -327,33 +382,20 @@ async function fetchThumbnailFromTab(tabId, videoUrl) {
     });
 
     if (response && response.thumbnails && response.thumbnails.length > 0) {
-      // 우선순위: capture > poster > og:image > twitter:image > schema.org > related-img
-      const priority = ['capture', 'poster', 'og:image', 'twitter:image', 'schema.org', 'related-img'];
-      let bestThumbnail = null;
-
-      for (const source of priority) {
-        const found = response.thumbnails.find(t => t.source === source);
-        if (found) {
-          bestThumbnail = found.url;
-          break;
-        }
-      }
-
-      if (!bestThumbnail && response.thumbnails.length > 0) {
-        bestThumbnail = response.thumbnails[0].url;
-      }
+      const bestThumbnail = VideoUtils.getBestThumbnailUrl(response.thumbnails);
 
       // 해당 비디오에 썸네일 할당
       if (detectedVideos[tabId]) {
         const video = detectedVideos[tabId].find(v => v.url === videoUrl);
         if (video) {
           video.thumbnail = bestThumbnail;
-          console.log('Thumbnail assigned:', bestThumbnail);
+          persistSessionState(['detectedVideos']);
+          LoggerManager.debug(LOG_CLASS, 'fetchThumbnailFromTab', 'Thumbnail assigned', { bestThumbnail });
         }
       }
     }
   } catch (e) {
     // Content script가 로드되지 않은 페이지일 수 있음
-    console.log('Thumbnail fetch failed:', e.message);
+    LoggerManager.debug(LOG_CLASS, 'fetchThumbnailFromTab', 'Thumbnail fetch failed', { message: e.message });
   }
 }

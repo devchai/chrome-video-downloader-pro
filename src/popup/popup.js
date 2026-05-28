@@ -23,6 +23,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 });
 
+const LOG_CLASS = 'Popup';
+
 // URL → { btn, statusEl } 매핑 (팝업 재오픈 시에도 동기화 가능)
 let downloadUIMap = {};
 // 실시간 메시지를 받은 URL 추적 (restore 시 stale 데이터 방지)
@@ -37,16 +39,16 @@ function updateProgressUI(message) {
 
   // Error Handling -> Fallback to Copy Command
   if (status.startsWith("Error")) {
-    console.error('[Popup] Download failed:', status);
+    LoggerManager.error(LOG_CLASS, 'updateProgressUI', 'Download failed', { status });
     if (errorDetails) {
-      console.error('[Popup] Error Details:', {
+      LoggerManager.error(LOG_CLASS, 'updateProgressUI', 'Error details', {
         timestamp: errorDetails.timestamp,
         method: errorDetails.method,
         message: errorDetails.message,
         errorName: errorDetails.errorName,
         errorMessage: errorDetails.errorMessage
       });
-      console.error('[Popup] Stack Trace:', errorDetails.errorStack);
+      LoggerManager.error(LOG_CLASS, 'updateProgressUI', 'Stack trace', { stack: errorDetails.errorStack });
     }
 
     let displayMessage = "Failed";
@@ -65,7 +67,7 @@ function updateProgressUI(message) {
     statusEl.textContent = `${displayMessage}. Copied cmd!`;
     statusEl.style.color = "#ef4444";
 
-    const cmd = `yt-dlp "${url}" --referer "https://twitter.com/"`;
+    const cmd = VideoUtils.buildYtDlpCommand(url, ui.referer);
     navigator.clipboard.writeText(cmd);
 
     btn.classList.remove('downloading');
@@ -97,7 +99,11 @@ function updateProgressUI(message) {
     statusEl.textContent = status;
     statusEl.style.color = "#f59e0b";
     btn.classList.add('downloading');
-    btn.innerHTML = `<span style="font-size:10px; font-weight:bold">${percent}%</span>`;
+    const progress = document.createElement('span');
+    progress.style.fontSize = '10px';
+    progress.style.fontWeight = 'bold';
+    progress.textContent = `${percent}%`;
+    btn.replaceChildren(progress);
     btn.style.background = '#f59e0b';
   }
 }
@@ -124,8 +130,9 @@ function renderVideos(videos, pageTitle) {
     const card = document.createElement('div');
     card.className = 'video-card';
 
-    const isHLS = video.contentType.includes('mpegurl') || video.contentType.includes('dash') || video.contentType.includes('octet-stream');
-    const format = isHLS ? 'HLS/Stream' : video.contentType.split('/')[1].toUpperCase();
+    const isHLS = VideoUtils.isHlsLikeContentType(video.contentType);
+    const isDash = VideoUtils.isDashContentType(video.contentType);
+    const format = isHLS ? 'HLS/Stream' : isDash ? 'DASH/Stream' : video.contentType.split('/')[1].toUpperCase();
     const sizeStr = video.size > 0
       ? (video.size / 1024 / 1024).toFixed(1) + ' MB'
       : 'Stream';
@@ -135,46 +142,84 @@ function renderVideos(videos, pageTitle) {
     if (filename.length > 30) filename = filename.substring(0, 30) + '...';
     if (!filename || filename.trim() === '') filename = `Video ${index + 1}`;
 
-    const thumbnailHtml = video.thumbnail
-      ? `<div class="video-thumbnail"><img src="${video.thumbnail}" alt="thumbnail" onerror="this.parentElement.innerHTML='<div class=\\'no-thumb\\'><svg width=\\'24\\' height=\\'24\\' viewBox=\\'0 0 24 24\\' fill=\\'none\\' stroke=\\'currentColor\\'><polygon points=\\'5 3 19 12 5 21 5 3\\'></polygon></svg></div>'"/></div>`
-      : `<div class="video-thumbnail"><div class="no-thumb"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></div></div>`;
+    card.appendChild(createThumbnailElement(video.thumbnail));
 
-    card.innerHTML = `
-      ${thumbnailHtml}
-      <div class="video-info">
-        <div class="video-title" title="${video.url}">${pageTitle || filename}</div>
-        <div class="video-meta">
-          <span class="badge ${isHLS ? 'hls' : 'mp4'}">${format}</span>
-          <span class="size">${sizeStr}</span>
-        </div>
-        <div class="status-text" style="font-size:10px; color:#64748b; height:14px;">Ready</div>
-      </div>
-      <div class="actions" style="display:flex; gap:8px;">
-        <button class="cmd-btn" title="Copy yt-dlp Command" style="background:none; border:none; color:#64748b; cursor:pointer;">
-           <span style="font-size:10px; font-family:monospace; border:1px solid #475569; padding:2px 4px; border-radius:4px;">CMD</span>
-        </button>
-        <button class="download-btn" data-url="${video.url}" data-type="${video.contentType}">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-            <polyline points="7 10 12 15 17 10"></polyline>
-            <line x1="12" y1="15" x2="12" y2="3"></line>
-          </svg>
-        </button>
-      </div>
+    const info = document.createElement('div');
+    info.className = 'video-info';
+
+    const title = document.createElement('div');
+    title.className = 'video-title';
+    title.title = video.url;
+    title.textContent = pageTitle || filename;
+    info.appendChild(title);
+
+    const meta = document.createElement('div');
+    meta.className = 'video-meta';
+
+    const badge = document.createElement('span');
+    badge.className = `badge ${isHLS || isDash ? 'hls' : 'mp4'}`;
+    badge.textContent = format;
+    meta.appendChild(badge);
+
+    const size = document.createElement('span');
+    size.className = 'size';
+    size.textContent = sizeStr;
+    meta.appendChild(size);
+    info.appendChild(meta);
+
+    const statusEl = document.createElement('div');
+    statusEl.className = 'status-text';
+    statusEl.style.fontSize = '10px';
+    statusEl.style.color = '#64748b';
+    statusEl.style.height = '14px';
+    statusEl.textContent = 'Ready';
+    info.appendChild(statusEl);
+    card.appendChild(info);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    actions.style.display = 'flex';
+    actions.style.gap = '8px';
+
+    const cmdBtn = document.createElement('button');
+    cmdBtn.className = 'cmd-btn';
+    cmdBtn.title = 'Copy yt-dlp Command';
+    cmdBtn.style.background = 'none';
+    cmdBtn.style.border = 'none';
+    cmdBtn.style.color = '#64748b';
+    cmdBtn.style.cursor = 'pointer';
+    const cmdLabel = document.createElement('span');
+    cmdLabel.style.fontSize = '10px';
+    cmdLabel.style.fontFamily = 'monospace';
+    cmdLabel.style.border = '1px solid #475569';
+    cmdLabel.style.padding = '2px 4px';
+    cmdLabel.style.borderRadius = '4px';
+    cmdLabel.textContent = 'CMD';
+    cmdBtn.appendChild(cmdLabel);
+    actions.appendChild(cmdBtn);
+
+    const btn = document.createElement('button');
+    btn.className = 'download-btn';
+    btn.dataset.url = video.url;
+    btn.dataset.type = video.contentType;
+    btn.innerHTML = `
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+        <polyline points="7 10 12 15 17 10"></polyline>
+        <line x1="12" y1="15" x2="12" y2="3"></line>
+      </svg>
     `;
+    actions.appendChild(btn);
+    card.appendChild(actions);
 
     container.appendChild(card);
 
-    const btn = card.querySelector('.download-btn');
-    const statusEl = card.querySelector('.status-text');
-
     // URL → UI 요소 매핑 등록 (팝업 재오픈 시 상태 복원용)
-    downloadUIMap[video.url] = { btn, statusEl };
+    downloadUIMap[video.url] = { btn, statusEl, referer: video.referer };
 
     // CMD Copy Logic
-    const cmdBtn = card.querySelector('.cmd-btn');
     cmdBtn.addEventListener('click', () => {
-      const cmd = `yt-dlp "${video.url}" --referer "https://twitter.com/"`;
+      const cmd = VideoUtils.buildYtDlpCommand(video.url, video.referer);
       navigator.clipboard.writeText(cmd);
       statusEl.textContent = "Copied yt-dlp command!";
       statusEl.style.color = "#a78bfa";
@@ -187,13 +232,43 @@ function renderVideos(videos, pageTitle) {
     // Download Logic
     btn.addEventListener('click', () => {
       btn.classList.add('downloading');
-      btn.innerHTML = '...';
+      btn.textContent = '...';
       statusEl.textContent = "Trying...";
       statusEl.style.color = "#f59e0b";
 
       handleDownload(video, pageTitle);
     });
   });
+}
+
+function createThumbnailElement(thumbnailUrl) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'video-thumbnail';
+
+  if (thumbnailUrl) {
+    const img = document.createElement('img');
+    img.src = thumbnailUrl;
+    img.alt = 'thumbnail';
+    img.addEventListener('error', () => {
+      wrapper.replaceChildren(createNoThumbnailElement());
+    }, { once: true });
+    wrapper.appendChild(img);
+    return wrapper;
+  }
+
+  wrapper.appendChild(createNoThumbnailElement());
+  return wrapper;
+}
+
+function createNoThumbnailElement() {
+  const noThumb = document.createElement('div');
+  noThumb.className = 'no-thumb';
+  noThumb.innerHTML = `
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+      <polygon points="5 3 19 12 5 21 5 3"></polygon>
+    </svg>
+  `;
+  return noThumb;
 }
 
 function handleDownload(video, pageTitle) {

@@ -16,16 +16,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-const LOG_TAG = '[OffscreenDownloader]';
+const LOG_CLASS = 'OffscreenDownloader';
 
 function log(method, msg, data = null) {
-  const timestamp = new Date().toISOString();
-  const logMsg = `${LOG_TAG} ${method}: ${msg}`;
-  if (data) {
-    console.log(logMsg, data);
-  } else {
-    console.log(logMsg);
-  }
+  LoggerManager.debug(LOG_CLASS, method, msg, data || undefined);
 }
 
 function logError(method, msg, error = null) {
@@ -38,7 +32,7 @@ function logError(method, msg, error = null) {
     errorMessage: error?.message || 'No message',
     errorStack: error?.stack || 'No stack trace'
   };
-  console.error(`${LOG_TAG} ERROR in ${method}:`, errorDetails);
+  LoggerManager.error(LOG_CLASS, method, msg, errorDetails);
   return errorDetails;
 }
 
@@ -633,7 +627,7 @@ function mergeInitSegments(videoInit, audioInit) {
   const audioMoov = audioBoxes.find(b => b.type === 'moov');
 
   if (!videoMoov || !audioMoov) {
-    console.warn('[Offscreen] Missing moov box, falling back to video-only');
+    LoggerManager.warn(LOG_CLASS, 'mergeInitSegments', 'Missing moov box, falling back to video-only');
     return videoInit;
   }
 
@@ -646,7 +640,7 @@ function mergeInitSegments(videoInit, audioInit) {
   const audioMvex = audioMoovChildren.find(b => b.type === 'mvex');
 
   if (!audioTrak) {
-    console.warn('[Offscreen] No audio trak found');
+    LoggerManager.warn(LOG_CLASS, 'mergeInitSegments', 'No audio trak found');
     return videoInit;
   }
 
@@ -726,7 +720,11 @@ function mergeInitSegments(videoInit, audioInit) {
     pos += part.length;
   }
 
-  console.log(`[Offscreen] Merged init: ${videoInit.length} + ${audioInit.length} -> ${result.length}`);
+  LoggerManager.debug(LOG_CLASS, 'mergeInitSegments', 'Merged init segments', {
+    videoInitSize: videoInit.length,
+    audioInitSize: audioInit.length,
+    mergedSize: result.length
+  });
   return result;
 }
 
