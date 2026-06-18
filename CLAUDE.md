@@ -37,6 +37,7 @@ Chrome Video Downloader Pro - Manifest V3 Chrome Extension that detects and down
 - Referer header capture and dynamic rule management via `declarativeNetRequest`
 - Badge count updates per tab
 - YouTube/Google video domain blocking
+- Per-tab video list cleared on navigation (`chrome.tabs.onUpdated`, `status === 'loading'`) via `clearTabVideos()` so only the current page's videos are shown. Full document loads/reloads reset the list; SPA in-page navigation (`pushState`) intentionally does not.
 
 **Offscreen Document** (`src/offscreen/offscreen.js`)
 - Heavy processing isolated from main thread
@@ -48,6 +49,7 @@ Chrome Video Downloader Pro - Manifest V3 Chrome Extension that detects and down
 - Displays detected videos per active tab
 - Progress UI for HLS downloads
 - Fallback: copies yt-dlp command on download failure
+- Download filename = active tab title (`pageTitle`), passed to the service worker and saved as `<title>.<ext>`. Sanitized by `VideoUtils.sanitizeFilename`, which preserves Unicode (Korean/Japanese/etc.), spaces, hyphens, and dots — replacing only filesystem-illegal characters (`< > : " / \ | ? *`) and control chars with spaces, collapsing whitespace, trimming leading/trailing dots/spaces, and capping length at 100 chars (fallback: `video_download`).
 
 **Content Script** (`src/content/content_script.js`)
 - Page metadata extraction (title, h1) for filename inference

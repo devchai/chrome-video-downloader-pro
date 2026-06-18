@@ -23,6 +23,11 @@
   const BLOCKED_DOMAINS = ['youtube.com', 'googlevideo.com', 'youtu.be'];
   const THUMBNAIL_PRIORITY = ['capture', 'poster', 'og:image', 'twitter:image', 'schema.org', 'related-img'];
 
+  // 파일 시스템에서 금지된 문자(Windows/macOS/Linux 공통).
+  // 한글/일본어 등 유니코드 문자, 공백, 하이픈, 마침표는 보존하여 타이틀을 파일명으로 그대로 사용한다.
+  const ILLEGAL_FILENAME_CHARS = new Set(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
+  const MAX_FILENAME_LENGTH = 100; // 확장자 여유 포함, macOS 255 UTF-16 한도 내 안전
+
   function normalizeContentType(value) {
     return String(value || '').split(';')[0].toLowerCase().trim();
   }
@@ -39,11 +44,23 @@
 
   function sanitizeFilename(name) {
     if (!name) return 'video_download';
-    let clean = String(name).replace(/[^a-zA-Z0-9_\-]/g, '_').replace(/_+/g, '_');
-    clean = clean.replace(/^_+|_+$/g, '');
-    if (clean.length > 50) clean = clean.substring(0, 50);
-    if (clean === '') return 'video_download';
-    return clean;
+
+    // 금지 문자와 제어문자(U+0000~U+001F)만 공백으로 치환, 그 외 문자는 그대로 보존
+    let clean = '';
+    for (const ch of String(name)) {
+      clean += (ILLEGAL_FILENAME_CHARS.has(ch) || ch.charCodeAt(0) < 0x20) ? ' ' : ch;
+    }
+
+    clean = clean
+      .replace(/\s+/g, ' ')               // 연속 공백류를 하나로 축약
+      .trim()
+      .replace(/^[.\s]+|[.\s]+$/g, '');    // 앞뒤 마침표/공백 제거 (Windows trailing dot 방지)
+
+    if (clean.length > MAX_FILENAME_LENGTH) {
+      clean = clean.slice(0, MAX_FILENAME_LENGTH).trim();
+    }
+
+    return clean || 'video_download';
   }
 
   function isTargetVideoContentType(contentType) {

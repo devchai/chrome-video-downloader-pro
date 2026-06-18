@@ -373,6 +373,29 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   });
 });
 
+// 페이지 이동 시 이전 페이지의 감지 영상 정보 제거
+// 새 문서 로딩(status === 'loading')이 시작되면 해당 탭의 누적 목록을 비워
+// 현재 페이지에서 감지되는 영상만 표시되도록 한다.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'loading') return;
+  stateReady.then(() => clearTabVideos(tabId));
+});
+
+function clearTabVideos(tabId) {
+  const hadVideos = detectedVideos[tabId] && detectedVideos[tabId].length > 0;
+
+  if (detectedVideos[tabId]) {
+    delete detectedVideos[tabId];
+    persistSessionState(['detectedVideos']);
+  }
+
+  updateBadge(tabId);
+
+  if (hadVideos) {
+    LoggerManager.debug(LOG_CLASS, 'clearTabVideos', 'Cleared previous page videos on navigation', { tabId });
+  }
+}
+
 // 썸네일 추출 함수
 async function fetchThumbnailFromTab(tabId, videoUrl) {
   try {

@@ -3,11 +3,21 @@ const assert = require('node:assert/strict');
 
 const VideoUtils = require('../src/shared/video_utils.js');
 
-test('sanitizeFilename keeps safe names compact', () => {
-  assert.equal(VideoUtils.sanitizeFilename('Hello World: clip.mp4'), 'Hello_World_clip_mp4');
+test('sanitizeFilename preserves the title and strips only illegal characters', () => {
+  // 파일 시스템 금지 문자(<>:"/\|?*)만 공백으로 치환하고 공백은 하나로 축약
+  assert.equal(VideoUtils.sanitizeFilename('Hello World: clip.mp4'), 'Hello World clip.mp4');
+  assert.equal(VideoUtils.sanitizeFilename('a/b\\c:d*e?f'), 'a b c d e f');
+  // 빈 값/공백만 있는 값은 안전한 기본 파일명으로 폴백
   assert.equal(VideoUtils.sanitizeFilename(''), 'video_download');
-  assert.equal(VideoUtils.sanitizeFilename('한글 제목'), 'video_download');
-  assert.equal(VideoUtils.sanitizeFilename('a'.repeat(80)), 'a'.repeat(50));
+  assert.equal(VideoUtils.sanitizeFilename('   '), 'video_download');
+  // 한글/유니코드 타이틀을 그대로 보존 (핵심 동작)
+  assert.equal(VideoUtils.sanitizeFilename('한글 제목'), '한글 제목');
+  assert.equal(VideoUtils.sanitizeFilename('日本語のタイトル'), '日本語のタイトル');
+  // 앞뒤 공백/마침표 제거 (Windows trailing dot 방지)
+  assert.equal(VideoUtils.sanitizeFilename('  제목.  '), '제목');
+  // 길이 제한: 100자 이하는 유지, 초과분만 절단
+  assert.equal(VideoUtils.sanitizeFilename('a'.repeat(80)), 'a'.repeat(80));
+  assert.equal(VideoUtils.sanitizeFilename('a'.repeat(150)), 'a'.repeat(100));
 });
 
 test('isBlockedUrl blocks YouTube and Google video domains only', () => {
